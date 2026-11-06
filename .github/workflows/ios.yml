@@ -1,11 +1,12 @@
 name: Build iOS IPA
 
-# 用法：把本文件放到你任意一个自己的 GitHub 仓库里（路径 .github/workflows/ios.yml），
-# 在 Actions 页点 "Run workflow"，约 20~35 分钟产出未签名 arm64 IPA。
+# 用法：放进你自己的任意 GitHub 仓库（路径 .github/workflows/ios.yml）→
+# Actions → Build iOS IPA → Run workflow。约 10~35 分钟产出未签名 arm64 IPA。
 #
-# 默认构建 PR #4 的分支（ken861222/HGhub: feat/ios-support）——那套改动已经处理了
-# iOS 布局、WKWebView 黑屏、custom-protocol 白屏、画面裁切，并且作者在真机上验证过。
-# 等该 PR 合进 main 之后，把下面的 repo/ref 改成 Minireel/HGhub + main 即可。
+# 默认构建 PR #4 的分支（ken861222/HGhub: feat/ios-support），并在构建前自动给
+# scripts/ios/main.mm 追加一段原生补丁，让 WKWebView 真正铺满屏幕、消掉底部黑边。
+# 不想要这段补丁：Run workflow 时把 stretch 选成 false（回到 PR 原样）。
+# 补丁只改 scrollView 的 contentInset 与视图 frame，不碰 opaque / alpha / 子视图层级。
 on:
   workflow_dispatch:
     inputs:
@@ -17,6 +18,11 @@ on:
         description: 分支 / tag / 提交 SHA
         required: false
         default: feat/ios-support
+      stretch:
+        description: 追加「WebView 撑满屏幕」原生补丁（修底部黑边）
+        type: boolean
+        required: false
+        default: true
 
 concurrency:
   group: ios-ipa
@@ -42,7 +48,7 @@ jobs:
 
       - name: 记录构建来源
         run: |
-          echo "repo: ${{ inputs.repo }}  ref: ${{ inputs.ref }}"
+          echo "repo: ${{ inputs.repo }}  ref: ${{ inputs.ref }}  stretch: ${{ inputs.stretch }}"
           git log -1 --format='commit %H  %ad  %s' --date=iso
 
       - uses: pnpm/action-setup@v4
@@ -71,6 +77,121 @@ jobs:
           pnpm -v
           rustc -V
 
+      - name: 追加「撑满屏幕」原生补丁
+        if: ${{ inputs.stretch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          F="scripts/ios/main.mm"
+          [ -f "$F" ] || { echo "::error::找不到 $F"; exit 1; }
+          if grep -q 'HGFSFillWindow' "$F"; then
+            echo "已打过补丁，跳过"
+            exit 0
+          fi
+          {
+            printf '%s\n' \
+            '/* ═════ CI 补丁：让网页真正铺满屏幕，修掉底部约 93pt 的原生黑边 ═════' \
+            ' *' \
+            ' * 现象：屏幕 852pt，网页只排到 759pt = 852 − 59（顶部安全区）− 34（Home 条），' \
+            ' *      剩下一条露出 WKWebView / window 的底色（PR 已刷成 #1a1a1a，于是从「白条」' \
+            ' *      变成了「黑边」）。' \
+            ' * 主修：WKWebView 默认 contentInsetAdjustmentBehavior = Automatic，会按安全区给' \
+            ' *      scrollView 加内边距，网页可用高度因此比屏幕矮。改成 Never 并清零内边距，' \
+            ' *      网页就能拿到整块屏幕；viewport-fit=cover 下 env(safe-area-inset-*) 照常' \
+            ' *      有效，留白交给 CSS。' \
+            ' * 兜底：若 view 的 frame 本身比屏幕矮，把 root view 撑到 window.bounds，并把' \
+            ' *      root → WKWebView 这条链每层撑满父视图。' \
+            ' * 只调整布局量，绝不碰 opaque / alpha / hidden / 子视图层级 —— 那是之前' \
+            ' * 「视频一开始播放、画面和按钮整层消失」的原因。' \
+            ' */' \
+            'static UIView *HGFSFindWebView(UIView *v) {' \
+            '  if ([v respondsToSelector:NSSelectorFromString(@"scrollView")]) return v;' \
+            '  for (UIView *s in v.subviews) {' \
+            '    UIView *hit = HGFSFindWebView(s);' \
+            '    if (hit) return hit;' \
+            '  }' \
+            '  return nil;' \
+            '}' \
+            '' \
+            'static void HGFSResetInset(UIView *web) {' \
+            '  id sv = [web valueForKey:@"scrollView"];' \
+            '  if (![sv isKindOfClass:[UIScrollView class]]) return;' \
+            '  UIScrollView *sc = (UIScrollView *)sv;' \
+            '  if (sc.contentInsetAdjustmentBehavior != UIScrollViewContentInsetAdjustmentNever) {' \
+            '    sc.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;' \
+            '  }' \
+            '  if (!UIEdgeInsetsEqualToEdgeInsets(sc.contentInset, UIEdgeInsetsZero)) {' \
+            '    sc.contentInset = UIEdgeInsetsZero;' \
+            '  }' \
+            '}' \
+            '' \
+            '/* 把 leaf 到 top 之间的每一层视图撑满各自父视图。' \
+            '   只改 frame / autoresizingMask，不动 translatesAutoresizingMaskIntoConstraints，' \
+            '   避免和工程里已有的 Auto Layout 约束打架。 */' \
+            'static void HGFSFillChain(UIView *leaf, UIView *top) {' \
+            '  UIView *v = leaf;' \
+            '  while (v && v != top) {' \
+            '    UIView *p = v.superview;' \
+            '    if (!p) break;' \
+            '    if (!CGRectEqualToRect(v.frame, p.bounds)) v.frame = p.bounds;' \
+            '    v.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;' \
+            '    v = p;' \
+            '  }' \
+            '}' \
+            '' \
+            'static void HGFSFillWindow(UIWindow *w) {' \
+            '  UIView *root = w.rootViewController.view;' \
+            '  if (!root) return;' \
+            '  if (!CGRectEqualToRect(root.frame, w.bounds)) root.frame = w.bounds;' \
+            '  UIView *web = HGFSFindWebView(root);' \
+            '  if (!web) return;' \
+            '  HGFSResetInset(web);' \
+            '  HGFSFillChain(web, root);' \
+            '}' \
+            '' \
+            'static void HGFSApply(void) {' \
+            '  for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {' \
+            '    if (![scene isKindOfClass:[UIWindowScene class]]) continue;' \
+            '    for (UIWindow *w in ((UIWindowScene *)scene).windows) {' \
+            '      if (w.windowLevel != UIWindowLevelNormal) continue;' \
+            '      HGFSFillWindow(w);' \
+            '    }' \
+            '  }' \
+            '}' \
+            '' \
+            'static void HGFSApplyAfter(double delay) {' \
+            '  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),' \
+            '                 dispatch_get_main_queue(), ^{ HGFSApply(); });' \
+            '}' \
+            '' \
+            '__attribute__((constructor))' \
+            'static void HGFSInstall(void) {' \
+            '  dispatch_async(dispatch_get_main_queue(), ^{' \
+            '    for (NSNumber *d in @[@0.05, @0.15, @0.35, @0.8, @1.5, @2.5]) {' \
+            '      HGFSApplyAfter(d.doubleValue);' \
+            '    }' \
+            '  });' \
+            '  [[NSNotificationCenter defaultCenter]' \
+            '    addObserverForName:UIApplicationDidBecomeActiveNotification' \
+            '                object:nil' \
+            '                 queue:[NSOperationQueue mainQueue]' \
+            '            usingBlock:^(NSNotification * _Nonnull note) {' \
+            '              HGFSApplyAfter(0.2);' \
+            '              HGFSApplyAfter(1.0);' \
+            '            }];' \
+            '  [[NSNotificationCenter defaultCenter]' \
+            '    addObserverForName:UIDeviceOrientationDidChangeNotification' \
+            '                object:nil' \
+            '                 queue:[NSOperationQueue mainQueue]' \
+            '            usingBlock:^(NSNotification * _Nonnull note) {' \
+            '              HGFSApplyAfter(0.3);' \
+            '              HGFSApplyAfter(0.8);' \
+            '            }];' \
+            '}'
+          } >> "$F"
+          echo "--- 补丁尾部 ---"
+          tail -6 "$F"
+
       - name: 安装前端依赖
         run: pnpm install --frozen-lockfile
 
@@ -96,10 +217,8 @@ jobs:
           lipo -info "$APP/$EXEC"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
-          # 前端资源必须真的打进二进制，否则装上去是白屏（custom-protocol 没生效的典型症状）。
-          # 注意：不要写 `strings ... | grep -q` —— grep -q 命中即退出，上游 strings 会吃
-          # SIGPIPE 报 "failed to flush output"，在 pipefail 下整条管道判失败，于是假报白屏。
-          # 直接用 grep -a 读二进制，不走管道。
+          # 不要写 `strings ... | grep -q`：grep -q 命中即退出，strings 会吃 SIGPIPE，
+          # 在 pipefail 下整条管道判失败，会假报「白屏」。
           if ! grep -aq '/assets/index-' "$APP/$EXEC"; then
             echo "::error::前端资源没有内嵌到二进制，装上去会白屏"
             exit 1
@@ -119,11 +238,14 @@ jobs:
           {
             echo "### 构建完成"
             echo ""
-            echo "产物是 **未签名** IPA，直接装会失败，需要先用自己的 Apple ID 重签："
+            echo "- 源码：\`${{ inputs.repo }}\` @ \`${{ inputs.ref }}\`"
+            echo "- 撑满屏幕补丁：\`${{ inputs.stretch }}\`"
             echo ""
-            echo "1. Windows 装 [Sideloadly](https://sideloadly.io/)（先装 iTunes 的非 Microsoft Store 版）"
+            echo "产物是 **未签名** IPA，要先用自己的 Apple ID 重签："
+            echo ""
+            echo "1. Windows 装 [Sideloadly](https://sideloadly.io/)（iTunes 用官网版，别用 Microsoft Store 版）"
             echo "2. IPA 拖进去 → 填 Apple ID → Start"
             echo "3. 手机 设置 → 通用 → VPN与设备管理 → 信任该描述文件"
             echo ""
-            echo "免费 Apple ID 签出来的 app **7 天失效**，到期重签一次即可。"
+            echo "免费 Apple ID 签出来的 app **7 天失效**，到期重签一次。"
           } >> "$GITHUB_STEP_SUMMARY"
