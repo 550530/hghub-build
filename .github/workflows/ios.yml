@@ -1,0 +1,125 @@
+name: Build iOS IPA
+
+# 用法：把本文件放到你任意一个自己的 GitHub 仓库里（路径 .github/workflows/ios.yml），
+# 在 Actions 页点 "Run workflow"，约 20~35 分钟产出未签名 arm64 IPA。
+#
+# 默认构建 PR #4 的分支（ken861222/HGhub: feat/ios-support）——那套改动已经处理了
+# iOS 布局、WKWebView 黑屏、custom-protocol 白屏、画面裁切，并且作者在真机上验证过。
+# 等该 PR 合进 main 之后，把下面的 repo/ref 改成 Minireel/HGhub + main 即可。
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 源码仓库（owner/name）
+        required: false
+        default: ken861222/HGhub
+      ref:
+        description: 分支 / tag / 提交 SHA
+        required: false
+        default: feat/ios-support
+
+concurrency:
+  group: ios-ipa
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+
+jobs:
+  ios:
+    name: iOS arm64 (unsigned ipa)
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: 记录构建来源
+        run: |
+          echo "repo: ${{ inputs.repo }}  ref: ${{ inputs.ref }}"
+          git log -1 --format='commit %H  %ad  %s' --date=iso
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ios
+
+      - name: 环境信息
+        run: |
+          xcodebuild -version
+          swift --version
+          node -v
+          pnpm -v
+          rustc -V
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 生成 iOS 工程
+        run: pnpm tauri ios init --ci
+
+      - name: 构建未签名 IPA
+        env:
+          IPA_OUT: ${{ github.workspace }}/HGhub-unsigned.ipa
+        run: pnpm ios:ipa
+
+      - name: 校验产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          IPA="HGhub-unsigned.ipa"
+          [ -f "$IPA" ] || { echo "::error::没有产出 IPA"; exit 1; }
+          ls -lh "$IPA"
+          # 前端资源必须真的打进二进制，否则装上去就是白屏（custom-protocol 没生效的典型症状）
+          rm -rf /tmp/ipa-check && mkdir -p /tmp/ipa-check
+          unzip -q "$IPA" -d /tmp/ipa-check
+          APP="$(ls -d /tmp/ipa-check/Payload/*.app | head -1)"
+          EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          lipo -info "$APP/$EXEC"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
+          if ! strings "$APP/$EXEC" | grep -q '/assets/index-'; then
+            echo "::error::前端资源没有内嵌到二进制，装上去会白屏"
+            exit 1
+          fi
+
+      - name: 上传 ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-ios-ipa
+          path: HGhub-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 收尾提示
+        run: |
+          {
+            echo "### 构建完成"
+            echo ""
+            echo "产物是 **未签名** IPA，直接装会失败，需要先用自己的 Apple ID 重签："
+            echo ""
+            echo "1. Windows 装 [Sideloadly](https://sideloadly.io/)（先装 iTunes 的非 Microsoft Store 版）"
+            echo "2. IPA 拖进去 → 填 Apple ID → Start"
+            echo "3. 手机 设置 → 通用 → VPN与设备管理 → 信任该描述文件"
+            echo ""
+            echo "免费 Apple ID 签出来的 app **7 天失效**，到期重签一次即可。"
+          } >> "$GITHUB_STEP_SUMMARY"
