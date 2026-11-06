@@ -89,18 +89,22 @@ jobs:
           IPA="HGhub-unsigned.ipa"
           [ -f "$IPA" ] || { echo "::error::没有产出 IPA"; exit 1; }
           ls -lh "$IPA"
-          # 前端资源必须真的打进二进制，否则装上去就是白屏（custom-protocol 没生效的典型症状）
           rm -rf /tmp/ipa-check && mkdir -p /tmp/ipa-check
           unzip -q "$IPA" -d /tmp/ipa-check
-          APP="$(ls -d /tmp/ipa-check/Payload/*.app | head -1)"
+          APP="$(find /tmp/ipa-check/Payload -maxdepth 1 -name '*.app' -print -quit)"
           EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
           lipo -info "$APP/$EXEC"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
-          if ! strings "$APP/$EXEC" | grep -q '/assets/index-'; then
+          # 前端资源必须真的打进二进制，否则装上去是白屏（custom-protocol 没生效的典型症状）。
+          # 注意：不要写 `strings ... | grep -q` —— grep -q 命中即退出，上游 strings 会吃
+          # SIGPIPE 报 "failed to flush output"，在 pipefail 下整条管道判失败，于是假报白屏。
+          # 直接用 grep -a 读二进制，不走管道。
+          if ! grep -aq '/assets/index-' "$APP/$EXEC"; then
             echo "::error::前端资源没有内嵌到二进制，装上去会白屏"
             exit 1
           fi
+          echo "OK: 前端资源已内嵌，bundle 结构正常"
 
       - name: 上传 ipa
         uses: actions/upload-artifact@v4
