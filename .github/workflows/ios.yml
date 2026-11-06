@@ -6,6 +6,7 @@ name: Build iOS IPA
 # 默认构建 PR #4 的分支（ken861222/HGhub: feat/ios-support），并在构建前自动给
 # scripts/ios/main.mm 追加一段原生补丁，让 WKWebView 真正铺满屏幕、消掉底部黑边。
 # 不想要这段补丁：Run workflow 时把 stretch 选成 false（回到 PR 原样）。
+# 保留 stretch=true 时，启动后左上角会显示 60 秒诊断文字（窗口/webview 尺寸、innerHeight）。
 # 补丁只改 scrollView 的 contentInset 与视图 frame，不碰 opaque / alpha / 子视图层级。
 on:
   workflow_dispatch:
@@ -19,7 +20,7 @@ on:
         required: false
         default: feat/ios-support
       stretch:
-        description: 追加「WebView 撑满屏幕」原生补丁（修底部黑边）
+        description: 追加「撑满 + 诊断」原生补丁（修底部黑边，并在左上角显示尺寸）
         type: boolean
         required: false
         default: true
@@ -77,33 +78,37 @@ jobs:
           pnpm -v
           rustc -V
 
-      - name: 追加「撑满屏幕」原生补丁
+      - name: 追加原生补丁（撑满 + 诊断）
         if: ${{ inputs.stretch }}
         shell: bash
         run: |
           set -euo pipefail
           F="scripts/ios/main.mm"
           [ -f "$F" ] || { echo "::error::找不到 $F"; exit 1; }
-          if grep -q 'HGFSFillWindow' "$F"; then
+          if grep -q 'HGFSFillTopDown' "$F"; then
             echo "已打过补丁，跳过"
             exit 0
           fi
           {
             printf '%s\n' \
-            '/* ═════ CI 补丁：让网页真正铺满屏幕，修掉底部约 93pt 的原生黑边 ═════' \
+            '/* ═════ CI 补丁：撑满 + 诊断 ═════' \
             ' *' \
-            ' * 现象：屏幕 852pt，网页只排到 759pt = 852 − 59（顶部安全区）− 34（Home 条），' \
-            ' *      剩下一条露出 WKWebView / window 的底色（PR 已刷成 #1a1a1a，于是从「白条」' \
-            ' *      变成了「黑边」）。' \
-            ' * 主修：WKWebView 默认 contentInsetAdjustmentBehavior = Automatic，会按安全区给' \
-            ' *      scrollView 加内边距，网页可用高度因此比屏幕矮。改成 Never 并清零内边距，' \
-            ' *      网页就能拿到整块屏幕；viewport-fit=cover 下 env(safe-area-inset-*) 照常' \
-            ' *      有效，留白交给 CSS。' \
-            ' * 兜底：若 view 的 frame 本身比屏幕矮，把 root view 撑到 window.bounds，并把' \
-            ' *      root → WKWebView 这条链每层撑满父视图。' \
-            ' * 只调整布局量，绝不碰 opaque / alpha / hidden / 子视图层级 —— 那是之前' \
-            ' * 「视频一开始播放、画面和按钮整层消失」的原因。' \
+            ' * 目标：让 WKWebView 真正铺满屏幕，消掉底部 93pt 原生色带（759 = 852 − 59 − 34）。' \
+            ' * 上一版只改了 contentInset 与 frame，装上后几何完全没变（仍是 759），说明高度是由' \
+            ' * Auto Layout 约束定的，或者我们改到的视图并不是那个真正被压扁的容器。' \
+            ' *' \
+            ' * 本版做三件事：' \
+            ' *   ① 顺序修正：自上而下撑（先放大祖先，再放大后代），并反复重试；' \
+            ' *   ② 若撑完仍矮于窗口，就把这条链上的父视图约束摘掉（只在这条链上，不碰兄弟视图' \
+            ' *      之外的层级），让 frame 赋值能真正生效；' \
+            ' *   ③ 左上角显示一块诊断文字（窗口 / root / webview / 父视图 / safeArea / JS 的' \
+            ' *      innerHeight、clientHeight 与 env 探针），60 秒后自动消失。' \
+            ' *' \
+            ' * 仍然绝不碰 opaque / alpha / hidden / 子视图层级 —— 那是「视频一播、画面和按钮整层' \
+            ' * 消失」的原因。只碰 frame、contentInset 和约束。' \
             ' */' \
+            '#import <WebKit/WebKit.h>' \
+            '' \
             'static UIView *HGFSFindWebView(UIView *v) {' \
             '  if ([v respondsToSelector:NSSelectorFromString(@"scrollView")]) return v;' \
             '  for (UIView *s in v.subviews) {' \
@@ -113,40 +118,93 @@ jobs:
             '  return nil;' \
             '}' \
             '' \
-            'static void HGFSResetInset(UIView *web) {' \
-            '  id sv = [web valueForKey:@"scrollView"];' \
-            '  if (![sv isKindOfClass:[UIScrollView class]]) return;' \
-            '  UIScrollView *sc = (UIScrollView *)sv;' \
-            '  if (sc.contentInsetAdjustmentBehavior != UIScrollViewContentInsetAdjustmentNever) {' \
-            '    sc.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;' \
+            'static NSString *HGFSDim(UIView *v) {' \
+            '  if (!v) return @"-";' \
+            '  CGRect f = v.frame;' \
+            '  return [NSString stringWithFormat:@"%d×%d@%d,%d  %@",' \
+            '          (int)f.size.width, (int)f.size.height,' \
+            '          (int)f.origin.x, (int)f.origin.y,' \
+            '          NSStringFromClass([v class])];' \
+            '}' \
+            '' \
+            '/* 自上而下：先把 top 撑到窗口，再逐层把子视图撑满父视图。 */' \
+            'static void HGFSFillTopDown(UIView *top, UIView *web) {' \
+            '  NSMutableArray *chain = [NSMutableArray array];' \
+            '  UIView *v = web;' \
+            '  while (v && v != top) {' \
+            '    [chain insertObject:v atIndex:0];' \
+            '    v = v.superview;' \
             '  }' \
-            '  if (!UIEdgeInsetsEqualToEdgeInsets(sc.contentInset, UIEdgeInsetsZero)) {' \
-            '    sc.contentInset = UIEdgeInsetsZero;' \
+            '  for (UIView *node in chain) {' \
+            '    UIView *p = node.superview;' \
+            '    if (!p) continue;' \
+            '    if (!CGRectEqualToRect(node.frame, p.bounds)) node.frame = p.bounds;' \
+            '    node.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;' \
             '  }' \
             '}' \
             '' \
-            '/* 把 leaf 到 top 之间的每一层视图撑满各自父视图。' \
-            '   只改 frame / autoresizingMask，不动 translatesAutoresizingMaskIntoConstraints，' \
-            '   避免和工程里已有的 Auto Layout 约束打架。 */' \
-            'static void HGFSFillChain(UIView *leaf, UIView *top) {' \
-            '  UIView *v = leaf;' \
+            '/* 摘掉这条链上父视图的约束，让 frame 赋值不被 Auto Layout 覆盖。 */' \
+            'static void HGFSUnconstrain(UIView *top, UIView *web) {' \
+            '  UIView *v = web;' \
             '  while (v && v != top) {' \
             '    UIView *p = v.superview;' \
             '    if (!p) break;' \
-            '    if (!CGRectEqualToRect(v.frame, p.bounds)) v.frame = p.bounds;' \
-            '    v.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;' \
+            '    if (p.constraints.count > 0) [p removeConstraints:[p.constraints copy]];' \
             '    v = p;' \
             '  }' \
             '}' \
             '' \
-            'static void HGFSFillWindow(UIWindow *w) {' \
-            '  UIView *root = w.rootViewController.view;' \
-            '  if (!root) return;' \
-            '  if (!CGRectEqualToRect(root.frame, w.bounds)) root.frame = w.bounds;' \
-            '  UIView *web = HGFSFindWebView(root);' \
-            '  if (!web) return;' \
-            '  HGFSResetInset(web);' \
-            '  HGFSFillChain(web, root);' \
+            'static UILabel *HGFSLabel = nil;' \
+            'static BOOL HGFSLabelShown = NO;' \
+            '' \
+            'static void HGFSShowDiag(UIView *web, UIWindow *w) {' \
+            '  if (!HGFSLabelShown) {' \
+            '    HGFSLabelShown = YES;' \
+            '    HGFSLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 74, 380, 0)];' \
+            '    HGFSLabel.numberOfLines = 0;' \
+            '    HGFSLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];' \
+            '    HGFSLabel.textColor = [UIColor whiteColor];' \
+            '    HGFSLabel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];' \
+            '    HGFSLabel.userInteractionEnabled = NO;' \
+            '    [w addSubview:HGFSLabel];' \
+            '    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC)),' \
+            '                   dispatch_get_main_queue(), ^{ [HGFSLabel removeFromSuperview]; });' \
+            '  }' \
+            '  UIScrollView *sc = nil;' \
+            '  if ([web respondsToSelector:NSSelectorFromString(@"scrollView")]) {' \
+            '    id sv = [web valueForKey:@"scrollView"];' \
+            '    if ([sv isKindOfClass:[UIScrollView class]]) sc = (UIScrollView *)sv;' \
+            '  }' \
+            '  HGFSLabel.text = [NSString stringWithFormat:' \
+            '    @"win  %@\nroot %@\nweb  %@\nsup  %@\nsv2  %@\ncin  t%.0f b%.0f adj%ld\nsafe t%.0f b%.0f",' \
+            '    HGFSDim(w), HGFSDim(w.rootViewController.view), HGFSDim(web),' \
+            '    HGFSDim(web.superview), HGFSDim(web.superview ? web.superview.superview : nil),' \
+            '    sc ? sc.contentInset.top : -1, sc ? sc.contentInset.bottom : -1,' \
+            '    (long)(sc ? sc.contentInsetAdjustmentBehavior : -1),' \
+            '    w.safeAreaInsets.top, w.safeAreaInsets.bottom];' \
+            '  [HGFSLabel sizeToFit];' \
+            '  CGRect f = HGFSLabel.frame;' \
+            '  f.size.width = 380;' \
+            '  HGFSLabel.frame = f;' \
+            '' \
+            '  if ([web isKindOfClass:[WKWebView class]]) {' \
+            '    [(WKWebView *)web evaluateJavaScript:' \
+            '      @"(function(){var d=document.documentElement;"' \
+            '       "var e=document.createElement('"'"'div'"'"');"' \
+            '       "e.style.cssText='"'"'position:fixed;top:0;left:0;padding-top:env(safe-area-inset-top);"' \
+            '       "padding-bottom:env(safe-area-inset-bottom);visibility:hidden'"'"';"' \
+            '       "document.body.appendChild(e);var cs=getComputedStyle(e);"' \
+            '       "var r='"'"'js in '"'"'+window.innerHeight+'"'"' client '"'"'+d.clientHeight+'"'"' scroll '"'"'+d.scrollHeight"' \
+            '       "+'"'"' env '"'"'+cs.paddingTop+'"'"'/'"'"'+cs.paddingBottom;"' \
+            '       "e.remove();return r;})()"' \
+            '      completionHandler:^(id result, NSError *error) {' \
+            '        if (![result isKindOfClass:[NSString class]]) return;' \
+            '        UILabel *lb = HGFSLabel;' \
+            '        lb.text = [lb.text stringByAppendingFormat:@"\n%@", (NSString *)result];' \
+            '        [lb sizeToFit];' \
+            '        CGRect f2 = lb.frame; f2.size.width = 380; lb.frame = f2;' \
+            '      }];' \
+            '  }' \
             '}' \
             '' \
             'static void HGFSApply(void) {' \
@@ -154,7 +212,22 @@ jobs:
             '    if (![scene isKindOfClass:[UIWindowScene class]]) continue;' \
             '    for (UIWindow *w in ((UIWindowScene *)scene).windows) {' \
             '      if (w.windowLevel != UIWindowLevelNormal) continue;' \
-            '      HGFSFillWindow(w);' \
+            '      UIView *root = w.rootViewController.view;' \
+            '      if (!root) continue;' \
+            '      UIView *web = HGFSFindWebView(root);' \
+            '      if (!web) continue;' \
+            '' \
+            '      if (!CGRectEqualToRect(root.frame, w.bounds)) root.frame = w.bounds;' \
+            '      HGFSFillTopDown(root, web);' \
+            '' \
+            '      CGFloat want = w.bounds.size.height;' \
+            '      /* 撑完仍明显偏矮 → 说明是约束在压，摘掉这条链上的父约束再来一次。 */' \
+            '      if (web.frame.size.height + 20 < want && web.frame.size.height > 200) {' \
+            '        HGFSUnconstrain(root, web);' \
+            '        if (!CGRectEqualToRect(root.frame, w.bounds)) root.frame = w.bounds;' \
+            '        HGFSFillTopDown(root, web);' \
+            '      }' \
+            '      HGFSShowDiag(web, w);' \
             '    }' \
             '  }' \
             '}' \
@@ -167,7 +240,7 @@ jobs:
             '__attribute__((constructor))' \
             'static void HGFSInstall(void) {' \
             '  dispatch_async(dispatch_get_main_queue(), ^{' \
-            '    for (NSNumber *d in @[@0.05, @0.15, @0.35, @0.8, @1.5, @2.5]) {' \
+            '    for (NSNumber *d in @[@0.05, @0.15, @0.35, @0.8, @1.5, @2.5, @4.0, @6.0]) {' \
             '      HGFSApplyAfter(d.doubleValue);' \
             '    }' \
             '  });' \
@@ -178,14 +251,6 @@ jobs:
             '            usingBlock:^(NSNotification * _Nonnull note) {' \
             '              HGFSApplyAfter(0.2);' \
             '              HGFSApplyAfter(1.0);' \
-            '            }];' \
-            '  [[NSNotificationCenter defaultCenter]' \
-            '    addObserverForName:UIDeviceOrientationDidChangeNotification' \
-            '                object:nil' \
-            '                 queue:[NSOperationQueue mainQueue]' \
-            '            usingBlock:^(NSNotification * _Nonnull note) {' \
-            '              HGFSApplyAfter(0.3);' \
-            '              HGFSApplyAfter(0.8);' \
             '            }];' \
             '}'
           } >> "$F"
