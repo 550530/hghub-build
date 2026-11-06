@@ -3,11 +3,14 @@ name: Build iOS IPA
 # 用法：放进你自己的任意 GitHub 仓库（路径 .github/workflows/ios.yml）→
 # Actions → Build iOS IPA → Run workflow。约 10~35 分钟产出未签名 arm64 IPA。
 #
-# 默认构建 PR #4 的分支（ken861222/HGhub: feat/ios-support），并在构建前自动给
-# scripts/ios/main.mm 追加一段原生补丁，让 WKWebView 真正铺满屏幕、消掉底部黑边。
-# 不想要这段补丁：Run workflow 时把 stretch 选成 false（回到 PR 原样）。
-# 保留 stretch=true 时，启动后左上角会显示 60 秒诊断文字（窗口/webview 尺寸、innerHeight）。
-# 补丁只改 scrollView 的 contentInset 与视图 frame，不碰 opaque / alpha / 子视图层级。
+# 构建源码：PR #4 的分支（ken861222/HGhub: feat/ios-support），与作者原样一致，
+# 不打任何原生补丁。
+#
+# 唯一附加动作：构建前给 src/pages/Home.tsx 打一个「随机顺序」补丁
+#   - 首页原来是 api.feed(p, 10) 按服务器返回顺序累加，播放器永远从第 0 条起播，
+#     所以每次打开都是同一部、同一顺序；
+#   - 补丁把每一页返回的视频随机打散后再拼进列表，于是每次进 App 起播的那部不一样。
+# 补丁只是纯前端洗牌，不改数据、不改接口。不想用就把 random 选成 false。
 on:
   workflow_dispatch:
     inputs:
@@ -19,8 +22,8 @@ on:
         description: 分支 / tag / 提交 SHA
         required: false
         default: feat/ios-support
-      stretch:
-        description: 追加原生补丁（清零 WKWebView 遮挡区域，修底部黑边，左上角显示尺寸）
+      random:
+        description: 首页视频随机顺序
         type: boolean
         required: false
         default: true
@@ -49,7 +52,7 @@ jobs:
 
       - name: 记录构建来源
         run: |
-          echo "repo: ${{ inputs.repo }}  ref: ${{ inputs.ref }}  stretch: ${{ inputs.stretch }}"
+          echo "repo: ${{ inputs.repo }}  ref: ${{ inputs.ref }}  random: ${{ inputs.random }}"
           git log -1 --format='commit %H  %ad  %s' --date=iso
 
       - uses: pnpm/action-setup@v4
@@ -78,199 +81,45 @@ jobs:
           pnpm -v
           rustc -V
 
-      - name: 追加原生补丁（清零遮挡区域 + 诊断）
-        if: ${{ inputs.stretch }}
+      - name: 打「首页随机顺序」补丁
+        if: ${{ inputs.random }}
         shell: bash
         run: |
           set -euo pipefail
-          F="scripts/ios/main.mm"
+          F="src/pages/Home.tsx"
           [ -f "$F" ] || { echo "::error::找不到 $F"; exit 1; }
-          if grep -q 'HGFSShowDiag' "$F"; then
+          if grep -q 'shuffleIncoming' "$F"; then
             echo "已打过补丁，跳过"
             exit 0
           fi
+          n="$(grep -c 'const list = res?.items || \[\];' "$F" || true)"
+          if [ "$n" != "1" ]; then
+            echo "::error::锚点匹配 $n 次（应为 1），源码结构可能变了"
+            exit 1
+          fi
+          perl -0pi -e 's/const list = res\?\.items \|\| \[\];/const list = shuffleIncoming(res?.items || []);/' "$F"
+          m="$(grep -c 'const list = shuffleIncoming' "$F" || true)"
+          if [ "$m" != "1" ]; then
+            echo "::error::替换没有生效（匹配 $m 次），perl 替换失败"
+            exit 1
+          fi
           {
             printf '%s\n' \
-            '/* ═════ CI 补丁 v3：清零 WKWebView 的遮挡区域，让网页视口拿到整块屏幕 ═════' \
-            ' *' \
-            ' * 真机诊断结论（上一版叠层实测）：' \
-            ' *   win/root/web/sup 全是 393×852，contentInset 已是 0（adj=never），' \
-            ' *   但 JS 里 innerHeight / clientHeight / scrollHeight 都是 759 = 852 − 59 − 34，' \
-            ' *   而 env() 又正常返回 59px/34px。' \
-            ' * 即：原生视图尺寸没问题，是 WKWebView 给页面设了「遮挡区域」（obscuredInsets，' \
-            ' * Safari 用它给工具栏让位），把网页视口从 852 压到 759，网页只画到 759，剩下的' \
-            ' * 93pt 露出 WebView 自身的 #1a1a1a 底 → 视觉上的「底部超大黑边」。' \
-            ' *' \
-            ' * 做法：把 _obscuredInsets 清零（走 NSInvocation，不写私有声明；没有这个方法就跳过），' \
-            ' *      并保留 contentInset 清零与左上角 60 秒诊断叠层。' \
-            ' * 不再动任何视图 frame，也不碰 opaque / alpha / hidden / 子视图层级。' \
-            ' */' \
-            '#import <WebKit/WebKit.h>' \
-            '' \
-            'static UIView *HGFSFindWebView(UIView *v) {' \
-            '  if ([v respondsToSelector:NSSelectorFromString(@"scrollView")]) return v;' \
-            '  for (UIView *s in v.subviews) {' \
-            '    UIView *hit = HGFSFindWebView(s);' \
-            '    if (hit) return hit;' \
-            '  }' \
-            '  return nil;' \
-            '}' \
-            '' \
-            'static NSString *HGFSDim(UIView *v) {' \
-            '  if (!v) return @"-";' \
-            '  CGRect f = v.frame;' \
-            '  return [NSString stringWithFormat:@"%d×%d@%d,%d  %@",' \
-            '          (int)f.size.width, (int)f.size.height,' \
-            '          (int)f.origin.x, (int)f.origin.y,' \
-            '          NSStringFromClass([v class])];' \
-            '}' \
-            '' \
-            '/* 用 NSInvocation 读写可能存在的私有方法，避免编译期依赖私有声明。 */' \
-            'static BOOL HGFSReadInsets(id obj, NSString *sel, UIEdgeInsets *out) {' \
-            '  SEL s = NSSelectorFromString(sel);' \
-            '  if (![obj respondsToSelector:s]) return NO;' \
-            '  NSMethodSignature *sig = [obj methodSignatureForSelector:s];' \
-            '  if (!sig || sig.numberOfArguments < 2) return NO;' \
-            '  NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];' \
-            '  [inv setTarget:obj];' \
-            '  [inv setSelector:s];' \
-            '  [inv invoke];' \
-            '  UIEdgeInsets r = UIEdgeInsetsZero;' \
-            '  [inv getReturnValue:&r];' \
-            '  if (out) *out = r;' \
-            '  return YES;' \
-            '}' \
-            '' \
-            'static BOOL HGFSSetInsets(id obj, NSString *sel, UIEdgeInsets insets) {' \
-            '  SEL s = NSSelectorFromString(sel);' \
-            '  if (![obj respondsToSelector:s]) return NO;' \
-            '  NSMethodSignature *sig = [obj methodSignatureForSelector:s];' \
-            '  if (!sig || sig.numberOfArguments < 3) return NO;' \
-            '  NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];' \
-            '  [inv setTarget:obj];' \
-            '  [inv setSelector:s];' \
-            '  UIEdgeInsets v = insets;' \
-            '  [inv setArgument:&v atIndex:2];' \
-            '  [inv invoke];' \
-            '  return YES;' \
-            '}' \
-            '' \
-            'static UILabel *HGFSLabel = nil;' \
-            'static BOOL HGFSLabelShown = NO;' \
-            '' \
-            'static void HGFSShowDiag(UIView *web, UIWindow *w, BOOL hadObs, UIEdgeInsets obs) {' \
-            '  if (!HGFSLabelShown) {' \
-            '    HGFSLabelShown = YES;' \
-            '    HGFSLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 74, 380, 0)];' \
-            '    HGFSLabel.numberOfLines = 0;' \
-            '    HGFSLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];' \
-            '    HGFSLabel.textColor = [UIColor whiteColor];' \
-            '    HGFSLabel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];' \
-            '    HGFSLabel.userInteractionEnabled = NO;' \
-            '    [w addSubview:HGFSLabel];' \
-            '    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC)),' \
-            '                   dispatch_get_main_queue(), ^{ [HGFSLabel removeFromSuperview]; });' \
-            '  }' \
-            '  UIScrollView *sc = nil;' \
-            '  if ([web respondsToSelector:NSSelectorFromString(@"scrollView")]) {' \
-            '    id sv = [web valueForKey:@"scrollView"];' \
-            '    if ([sv isKindOfClass:[UIScrollView class]]) sc = (UIScrollView *)sv;' \
-            '  }' \
-            '  HGFSLabel.text = [NSString stringWithFormat:' \
-            '    @"win  %@\nweb  %@\nsup  %@\ncin  t%.0f b%.0f adj%ld\nsafe t%.0f b%.0f\nobs  %@",' \
-            '    HGFSDim(w), HGFSDim(web), HGFSDim(web.superview),' \
-            '    sc ? sc.contentInset.top : -1, sc ? sc.contentInset.bottom : -1,' \
-            '    (long)(sc ? sc.contentInsetAdjustmentBehavior : -1),' \
-            '    w.safeAreaInsets.top, w.safeAreaInsets.bottom,' \
-            '    hadObs ? [NSString stringWithFormat:@"t%.0f b%.0f l%.0f r%.0f", obs.top, obs.bottom, obs.left, obs.right]' \
-            '           : @"(无此方法)"];' \
-            '  [HGFSLabel sizeToFit];' \
-            '  CGRect f = HGFSLabel.frame;' \
-            '  f.size.width = 380;' \
-            '  HGFSLabel.frame = f;' \
-            '' \
-            '  if ([web isKindOfClass:[WKWebView class]]) {' \
-            '    [(WKWebView *)web evaluateJavaScript:' \
-            '      @"(function(){var d=document.documentElement;"' \
-            '       "var e=document.createElement('"'"'div'"'"');"' \
-            '       "e.style.cssText='"'"'position:fixed;top:0;left:0;padding-top:env(safe-area-inset-top);"' \
-            '       "padding-bottom:env(safe-area-inset-bottom);visibility:hidden'"'"';"' \
-            '       "document.body.appendChild(e);var cs=getComputedStyle(e);"' \
-            '       "var r='"'"'js in '"'"'+window.innerHeight+'"'"' client '"'"'+d.clientHeight+'"'"' scroll '"'"'+d.scrollHeight"' \
-            '       "+'"'"' env '"'"'+cs.paddingTop+'"'"'/'"'"'+cs.paddingBottom;"' \
-            '       "e.remove();return r;})()"' \
-            '      completionHandler:^(id result, NSError *error) {' \
-            '        if (![result isKindOfClass:[NSString class]]) return;' \
-            '        UILabel *lb = HGFSLabel;' \
-            '        lb.text = [lb.text stringByAppendingFormat:@"\n%@", (NSString *)result];' \
-            '        [lb sizeToFit];' \
-            '        CGRect f2 = lb.frame; f2.size.width = 380; lb.frame = f2;' \
-            '      }];' \
-            '  }' \
-            '}' \
-            '' \
-            'static void HGFSApply(void) {' \
-            '  for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {' \
-            '    if (![scene isKindOfClass:[UIWindowScene class]]) continue;' \
-            '    for (UIWindow *w in ((UIWindowScene *)scene).windows) {' \
-            '      if (w.windowLevel != UIWindowLevelNormal) continue;' \
-            '      UIView *root = w.rootViewController.view;' \
-            '      if (!root) continue;' \
-            '      UIView *web = HGFSFindWebView(root);' \
-            '      if (!web) continue;' \
-            '' \
-            '      /* ① 遮挡区域清零：这是网页视口只有 759 的根因。 */' \
-            '      UIEdgeInsets obs = UIEdgeInsetsZero;' \
-            '      BOOL hasObs = HGFSReadInsets(web, @"_obscuredInsets", &obs);' \
-            '      if (hasObs) {' \
-            '        if (!UIEdgeInsetsEqualToEdgeInsets(obs, UIEdgeInsetsZero)) {' \
-            '          HGFSSetInsets(web, @"_setObscuredInsets:", UIEdgeInsetsZero);' \
-            '        }' \
-            '      }' \
-            '' \
-            '      /* ② scrollView 内边距清零（保持 v2 的做法，成本为零）。 */' \
-            '      UIScrollView *sc = nil;' \
-            '      id sv = [web valueForKey:@"scrollView"];' \
-            '      if ([sv isKindOfClass:[UIScrollView class]]) sc = (UIScrollView *)sv;' \
-            '      if (sc) {' \
-            '        if (sc.contentInsetAdjustmentBehavior != UIScrollViewContentInsetAdjustmentNever) {' \
-            '          sc.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;' \
-            '        }' \
-            '        if (!UIEdgeInsetsEqualToEdgeInsets(sc.contentInset, UIEdgeInsetsZero)) {' \
-            '          sc.contentInset = UIEdgeInsetsZero;' \
-            '        }' \
-            '      }' \
-            '' \
-            '      /* ③ 诊断叠层（60 秒后自动消失）。 */' \
-            '      HGFSShowDiag(web, w, hasObs, obs);' \
-            '    }' \
-            '  }' \
-            '}' \
-            '' \
-            'static void HGFSApplyAfter(double delay) {' \
-            '  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),' \
-            '                 dispatch_get_main_queue(), ^{ HGFSApply(); });' \
-            '}' \
-            '' \
-            '__attribute__((constructor))' \
-            'static void HGFSInstall(void) {' \
-            '  dispatch_async(dispatch_get_main_queue(), ^{' \
-            '    for (NSNumber *d in @[@0.05, @0.2, @0.5, @1.0, @1.8, @2.8, @4.5]) {' \
-            '      HGFSApplyAfter(d.doubleValue);' \
-            '    }' \
-            '  });' \
-            '  [[NSNotificationCenter defaultCenter]' \
-            '    addObserverForName:UIApplicationDidBecomeActiveNotification' \
-            '                object:nil' \
-            '                 queue:[NSOperationQueue mainQueue]' \
-            '            usingBlock:^(NSNotification * _Nonnull note) {' \
-            '              HGFSApplyAfter(0.2);' \
-            '              HGFSApplyAfter(1.0);' \
-            '            }];' \
-            '}'
+              '' \
+              '/* ── CI 补丁：把每一页返回的视频随机打散，避免每次打开都是同一部、同一顺序 ── */' \
+              'function shuffleIncoming<T>(arr: T[]): T[] {' \
+              '  const a = arr.slice();' \
+              '  for (let i = a.length - 1; i > 0; i--) {' \
+              '    const j = Math.floor(Math.random() * (i + 1));' \
+              '    const t = a[i];' \
+              '    a[i] = a[j];' \
+              '    a[j] = t;' \
+              '  }' \
+              '  return a;' \
+              '}'
           } >> "$F"
-          echo "--- 补丁尾部 ---"
-          tail -6 "$F"
+          echo "--- 补丁落点 ---"
+          grep -n 'shuffleIncoming' "$F" | head -3
 
       - name: 安装前端依赖
         run: pnpm install --frozen-lockfile
@@ -319,7 +168,7 @@ jobs:
             echo "### 构建完成"
             echo ""
             echo "- 源码：\`${{ inputs.repo }}\` @ \`${{ inputs.ref }}\`"
-            echo "- 撑满屏幕补丁：\`${{ inputs.stretch }}\`"
+            echo "- 首页随机顺序：\`${{ inputs.random }}\`"
             echo ""
             echo "产物是 **未签名** IPA，要先用自己的 Apple ID 重签："
             echo ""
